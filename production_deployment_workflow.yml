@@ -1,0 +1,439 @@
+name: Production CI/CD with Complete Discord Integration
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      build-success: ${{ steps.build-result.outputs.success }}
+      build-time: ${{ steps.build-result.outputs.duration }}
+      commit-sha: ${{ github.sha }}
+      commit-message: ${{ github.event.head_commit.message }}
+      
+    steps:
+    - name: Notify Build Start
+      if: github.ref == 'refs/heads/main'
+      run: |
+        curl -H "Content-Type: application/json" -d '{
+          "embeds": [{
+            "title": "🔨 Build Started - ${{ github.repository }}",
+            "description": "**Commit:** [`${{ github.sha }}`.substring(0,7)](https://github.com/${{ github.repository }}/commit/${{ github.sha }})\n**Message:** ${{ github.event.head_commit.message }}",
+            "color": 3447003,
+            "fields": [
+              {"name": "🌿 Branch", "value": "${{ github.ref_name }}", "inline": true},
+              {"name": "👤 Author", "value": "${{ github.actor }}", "inline": true},
+              {"name": "🎯 Target", "value": "${{ secrets.DEPLOY_HOST }}", "inline": true}
+            ],
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+            "footer": {"text": "XRP Trading System CI/CD"}
+          }]
+        }' "${{ secrets.DISCORD_WEBHOOK }}"
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Record build start time
+      id: start-time
+      run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
+
+    - name: Restore dependencies
+      working-directory: ./project
+      run: find . -name "*.csproj" -exec dotnet restore {} \;
+
+    - name: Build
+      id: build
+      working-directory: ./project
+      run: |
+        if find . -name "*.csproj" -exec dotnet build {} --no-restore --configuration Release \;; then
+          echo "success=true" >> $GITHUB_OUTPUT
+        else
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Test
+      if: steps.build.outputs.success == 'true'
+      working-directory: ./project
+      run: |
+        if find . -name "*Test*.csproj" -o -name "*.Tests.csproj" | grep -q .; then
+          find . -name "*Test*.csproj" -o -name "*.Tests.csproj" -exec dotnet test {} --no-build --configuration Release --verbosity normal \;
+        else
+          echo "No test projects found, skipping tests"
+        fi
+
+    - name: Calculate build duration
+      id: build-result
+      run: |
+        start_time=${{ steps.start-time.outputs.start }}
+        end_time=$(date +%s)
+        duration=$((end_time - start_time))
+        echo "duration=${duration}s" >> $GITHUB_OUTPUT
+        echo "success=${{ steps.build.outputs.success }}" >> $GITHUB_OUTPUT
+
+    - name: Create deployment package
+      if: success()
+      working-directory: ./project
+      run: |
+        mkdir -p ../deployment-package
+        
+        MAIN_PROJECT=$(find . -name "*.csproj" | grep -E "(SignalEngine|TradeServer|FeedServer|MonitoringServer)" | head -1)
+        if [ -n "$MAIN_PROJECT" ]; then
+          echo "Publishing main project: $MAIN_PROJECT"
+          dotnet publish "$MAIN_PROJECT" --configuration Release --output ../deployment-package/app
+        else
+          echo "No main project found, creating basic deployment package"
+          mkdir -p ../deployment-package/app
+          find . -name "*.dll" -exec cp {} ../deployment-package/app/ \; 2>/dev/null || true
+        fi
+        
+        # Create enhanced deployment script with Discord notifications
+        cat > ../deployment-package/deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        SERVICE_NAME="${{ vars.SERVICE_NAME }}"
+        DEPLOY_PATH="${{ vars.DEPLOY_PATH }}"
+        DISCORD_WEBHOOK="${{ secrets.DISCORD_WEBHOOK }}"
+        
+        # Function to send Discord notification
+        send_discord_notification() {
+            local title="$1"
+            local description="$2"
+            local color="$3"
+            local emoji="$4"
+            
+            curl -s -H "Content-Type: application/json" -d "{
+              \"embeds\": [{
+                \"title\": \"$emoji $title\",
+                \"description\": \"$description\",
+                \"color\": $color,
+                \"fields\": [
+                  {\"name\": \"🖥️ Server\", \"value\": \"$(hostname) (${{ secrets.DEPLOY_HOST }})\", \"inline\": true},
+                  {\"name\": \"🔧 Service\", \"value\": \"$SERVICE_NAME\", \"inline\": true},
+                  {\"name\": \"⏰ Time\", \"value\": \"$(date)\", \"inline\": true}
+                ],
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+              }]
+            }" "$DISCORD_WEBHOOK" || true
+        }
+        
+        echo "🚀 Starting deployment of $SERVICE_NAME..."
+        send_discord_notification "Deployment Started" "Beginning deployment process for $SERVICE_NAME" 3447003 "🚀"
+        
+        # Create deployment directory
+        sudo mkdir -p "$DEPLOY_PATH"
+        sudo chown $USER:$USER "$DEPLOY_PATH"
+        
+        # Stop existing service if running
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo "⏹️  Stopping existing $SERVICE_NAME service..."
+            send_discord_notification "Service Stopping" "Stopping $SERVICE_NAME for deployment" 16776960 "⏹️"
+            sudo systemctl stop "$SERVICE_NAME"
+        fi
+        
+        # Backup existing deployment
+        if [ -d "$DEPLOY_PATH/current" ]; then
+            echo "📦 Backing up existing deployment..."
+            sudo mv "$DEPLOY_PATH/current" "$DEPLOY_PATH/backup-$(date +%Y%m%d-%H%M%S)" || true
+        fi
+        
+        # Deploy new version
+        echo "📁 Deploying new version..."
+        mkdir -p "$DEPLOY_PATH/current"
+        cp -r app/* "$DEPLOY_PATH/current/"
+        chmod +x "$DEPLOY_PATH/current"/*.dll 2>/dev/null || true
+        
+        # Find the main executable
+        MAIN_DLL=$(find "$DEPLOY_PATH/current" -name "*.dll" | grep -E "(SignalEngine|TradeServer|FeedServer|MonitoringServer)" | head -1)
+        if [ -z "$MAIN_DLL" ]; then
+            MAIN_DLL=$(find "$DEPLOY_PATH/current" -name "*.dll" | head -1)
+        fi
+        
+        if [ -n "$MAIN_DLL" ]; then
+            # Create or update systemd service
+            sudo tee "/etc/systemd/system/$SERVICE_NAME.service" > /dev/null << SYSTEMD_EOF
+        [Unit]
+        Description=$SERVICE_NAME Trading System Component
+        After=network.target
+        
+        [Service]
+        Type=notify
+        ExecStart=/usr/bin/dotnet $MAIN_DLL
+        Restart=always
+        RestartSec=10
+        User=$USER
+        WorkingDirectory=$DEPLOY_PATH/current
+        Environment=ASPNETCORE_ENVIRONMENT=Production
+        
+        [Install]
+        WantedBy=multi-user.target
+        SYSTEMD_EOF
+            
+            # Reload systemd and start service
+            sudo systemctl daemon-reload
+            sudo systemctl enable "$SERVICE_NAME"
+            
+            echo "🔄 Starting $SERVICE_NAME service..."
+            send_discord_notification "Service Starting" "Starting $SERVICE_NAME after deployment" 3447003 "🔄"
+            sudo systemctl start "$SERVICE_NAME"
+            
+            # Wait for service to start
+            sleep 10
+            
+            # Check service status
+            if systemctl is-active --quiet "$SERVICE_NAME"; then
+                echo "✅ $SERVICE_NAME deployed and started successfully"
+                UPTIME=$(systemctl show "$SERVICE_NAME" --property=ActiveEnterTimestamp --value)
+                MEMORY=$(systemctl show "$SERVICE_NAME" --property=MemoryCurrent --value)
+                send_discord_notification "Deployment Successful" "✅ $SERVICE_NAME is running successfully\n**Uptime:** $UPTIME\n**Memory:** $(($MEMORY/1024/1024))MB" 3066993 "🎉"
+                systemctl status "$SERVICE_NAME" --no-pager
+            else
+                echo "❌ $SERVICE_NAME failed to start"
+                ERROR_LOGS=$(sudo journalctl -u "$SERVICE_NAME" --no-pager -n 5 | tail -n 5)
+                send_discord_notification "Deployment Failed" "❌ $SERVICE_NAME failed to start\n\`\`\`$ERROR_LOGS\`\`\`" 15158332 "🚨"
+                sudo journalctl -u "$SERVICE_NAME" --no-pager -n 20
+                exit 1
+            fi
+        else
+            echo "⚠️  No executable found, deployment completed but service not started"
+            send_discord_notification "Deployment Warning" "⚠️ No executable found for $SERVICE_NAME" 15105570 "⚠️"
+        fi
+        
+        echo "🎉 Deployment completed successfully!"
+        EOF
+        
+        chmod +x ../deployment-package/deploy.sh
+
+    - name: Notify Build Result
+      if: always()
+      run: |
+        if [[ "${{ steps.build.outputs.success }}" == "true" ]]; then
+          STATUS_EMOJI="✅"
+          STATUS_COLOR=3066993
+          STATUS_TITLE="Build Successful"
+        else
+          STATUS_EMOJI="❌"
+          STATUS_COLOR=15158332
+          STATUS_TITLE="Build Failed"
+        fi
+        
+        curl -H "Content-Type: application/json" -d '{
+          "embeds": [{
+            "title": "'$STATUS_EMOJI' '$STATUS_TITLE' - ${{ github.repository }}",
+            "description": "**Commit:** [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})\n**Message:** ${{ github.event.head_commit.message }}",
+            "color": '$STATUS_COLOR',
+            "fields": [
+              {"name": "⏱️ Duration", "value": "${{ steps.build-result.outputs.duration }}", "inline": true},
+              {"name": "🔗 Logs", "value": "[View Details](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": true},
+              {"name": "📦 Artifacts", "value": "deployment-package-${{ github.sha }}", "inline": true}
+            ],
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+            "footer": {"text": "XRP Trading System CI/CD"}
+          }]
+        }' "${{ secrets.DISCORD_WEBHOOK }}"
+
+    - name: Upload deployment artifact
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-package-${{ github.sha }}
+        path: deployment-package/
+        retention-days: 30
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: success() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Download deployment artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: deployment-package-${{ github.sha }}
+        path: deployment-package/
+
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        
+        # Add bastion host to known hosts
+        ssh-keyscan -H ${{ secrets.BASTION_HOST }} >> ~/.ssh/known_hosts
+        
+        # Create SSH config for ProxyJump
+        cat > ~/.ssh/config << EOF
+        Host bastion
+          HostName ${{ secrets.BASTION_HOST }}
+          User ${{ secrets.BASTION_USER }}
+          IdentityFile ~/.ssh/id_rsa
+          StrictHostKeyChecking no
+        
+        Host target
+          HostName ${{ secrets.DEPLOY_HOST }}
+          User ${{ secrets.DEPLOY_USER }}
+          ProxyJump bastion
+          IdentityFile ~/.ssh/id_rsa
+          StrictHostKeyChecking no
+        EOF
+
+    - name: Test server connectivity
+      id: connectivity
+      run: |
+        if ssh -o ConnectTimeout=10 target 'echo "Connection successful"'; then
+          echo "connected=true" >> $GITHUB_OUTPUT
+        else
+          echo "connected=false" >> $GITHUB_OUTPUT
+          curl -H "Content-Type: application/json" -d '{
+            "embeds": [{
+              "title": "🔌 Connection Failed",
+              "description": "Unable to connect to target server ${{ secrets.DEPLOY_HOST }} via bastion host",
+              "color": 15158332,
+              "fields": [
+                {"name": "🎯 Target", "value": "${{ secrets.DEPLOY_HOST }}", "inline": true},
+                {"name": "🚪 Bastion", "value": "${{ secrets.BASTION_HOST }}", "inline": true},
+                {"name": "⚠️ Status", "value": "Deployment Skipped", "inline": true}
+              ]
+            }]
+          }' "${{ secrets.DISCORD_WEBHOOK }}"
+        fi
+
+    - name: Deploy to production server
+      if: steps.connectivity.outputs.connected == 'true'
+      id: deploy
+      run: |
+        echo "🚀 Deploying to ${{ secrets.DEPLOY_HOST }} via bastion ${{ secrets.BASTION_HOST }}"
+        
+        # Copy deployment package to target server
+        scp -r deployment-package/* target:~/
+        
+        # Execute deployment script (which includes Discord notifications)
+        ssh target 'bash ~/deploy.sh'
+        
+        echo "✅ Deployment completed successfully"
+        echo "success=true" >> $GITHUB_OUTPUT
+
+    - name: Capture deployment logs
+      if: steps.deploy.outputs.success == 'true'
+      run: |
+        echo "📊 Capturing deployment logs..."
+        
+        # Create log capture script with Discord notification
+        cat > capture_logs.sh << 'EOF'
+        #!/bin/bash
+        SERVICE_NAME="${{ vars.SERVICE_NAME }}"
+        LOG_FILE="deployment_logs_$(date +%Y%m%d_%H%M%S).log"
+        DISCORD_WEBHOOK="${{ secrets.DISCORD_WEBHOOK }}"
+        
+        echo "📊 Capturing logs for $SERVICE_NAME for 2 minutes..."
+        echo "=== Deployment Log Capture Started at $(date) ===" > "$LOG_FILE"
+        echo "Service: $SERVICE_NAME" >> "$LOG_FILE"
+        echo "Server: $(hostname)" >> "$LOG_FILE"
+        echo "Deployment Target: ${{ secrets.DEPLOY_HOST }}" >> "$LOG_FILE"
+        echo "Commit: ${{ github.sha }}" >> "$LOG_FILE"
+        echo "========================================" >> "$LOG_FILE"
+        
+        # Capture system status
+        echo "" >> "$LOG_FILE"
+        echo "=== System Status ===" >> "$LOG_FILE"
+        systemctl status "$SERVICE_NAME" --no-pager >> "$LOG_FILE" 2>&1 || echo "Service not found" >> "$LOG_FILE"
+        
+        echo "" >> "$LOG_FILE"
+        echo "=== Recent Service Logs ===" >> "$LOG_FILE"
+        sudo journalctl -u "$SERVICE_NAME" --no-pager -n 50 >> "$LOG_FILE" 2>&1 || echo "No logs found" >> "$LOG_FILE"
+        
+        echo "" >> "$LOG_FILE"
+        echo "=== Live Monitoring (2 minutes) ===" >> "$LOG_FILE"
+        timeout 120 sudo journalctl -u "$SERVICE_NAME" -f >> "$LOG_FILE" 2>&1 || echo "Live monitoring completed" >> "$LOG_FILE"
+        
+        echo "" >> "$LOG_FILE"
+        echo "=== Final Status Check ===" >> "$LOG_FILE"
+        systemctl status "$SERVICE_NAME" --no-pager >> "$LOG_FILE" 2>&1 || echo "Service not found" >> "$LOG_FILE"
+        echo "=== Log Capture Completed at $(date) ===" >> "$LOG_FILE"
+        
+        # Send log summary to Discord
+        LOG_SIZE=$(wc -l < "$LOG_FILE")
+        SERVICE_STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "unknown")
+        
+        curl -s -H "Content-Type: application/json" -d "{
+          \"embeds\": [{
+            \"title\": \"📋 Log Capture Complete\",
+            \"description\": \"Captured $LOG_SIZE lines of logs for $SERVICE_NAME\",
+            \"color\": 3447003,
+            \"fields\": [
+              {\"name\": \"🔧 Service\", \"value\": \"$SERVICE_NAME\", \"inline\": true},
+              {\"name\": \"📊 Status\", \"value\": \"$SERVICE_STATUS\", \"inline\": true},
+              {\"name\": \"📄 Log Lines\", \"value\": \"$LOG_SIZE\", \"inline\": true}
+            ]
+          }]
+        }" "$DISCORD_WEBHOOK" || true
+        
+        echo "📋 Logs captured to: $LOG_FILE"
+        ls -la "$LOG_FILE"
+        EOF
+        
+        chmod +x capture_logs.sh
+        scp capture_logs.sh target:~/
+        ssh target 'bash ~/capture_logs.sh'
+        
+        # Download the log file
+        scp target:~/deployment_logs_*.log ./
+
+    - name: Upload deployment logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-logs-${{ github.sha }}
+        path: deployment_logs_*.log
+        retention-days: 30
+
+    - name: Final deployment summary
+      if: always()
+      run: |
+        if [[ "${{ steps.connectivity.outputs.connected }}" == "true" && "${{ steps.deploy.outputs.success }}" == "true" ]]; then
+          STATUS_EMOJI="🎉"
+          STATUS_COLOR=3066993
+          STATUS_TITLE="Deployment Complete"
+          STATUS_DESC="✅ ${{ vars.SERVICE_NAME }} successfully deployed and running on ${{ secrets.DEPLOY_HOST }}"
+        elif [[ "${{ steps.connectivity.outputs.connected }}" == "false" ]]; then
+          STATUS_EMOJI="🔌"
+          STATUS_COLOR=15105570
+          STATUS_TITLE="Deployment Skipped"
+          STATUS_DESC="⚠️ Could not connect to target server - deployment skipped"
+        else
+          STATUS_EMOJI="❌"
+          STATUS_COLOR=15158332
+          STATUS_TITLE="Deployment Failed"
+          STATUS_DESC="❌ Deployment to ${{ secrets.DEPLOY_HOST }} failed - check logs"
+        fi
+        
+        curl -H "Content-Type: application/json" -d '{
+          "embeds": [{
+            "title": "'$STATUS_EMOJI' '$STATUS_TITLE'",
+            "description": "'$STATUS_DESC'",
+            "color": '$STATUS_COLOR',
+            "fields": [
+              {"name": "📦 Repository", "value": "${{ github.repository }}", "inline": true},
+              {"name": "🎯 Target", "value": "${{ secrets.DEPLOY_HOST }}", "inline": true},
+              {"name": "🔧 Service", "value": "${{ vars.SERVICE_NAME }}", "inline": true},
+              {"name": "📝 Commit", "value": "[`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})", "inline": true},
+              {"name": "🔗 Workflow", "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": true},
+              {"name": "📊 Artifacts", "value": "deployment-logs-${{ github.sha }}", "inline": true}
+            ],
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+            "footer": {"text": "XRP Trading System Production Deployment"}
+          }]
+        }' "${{ secrets.DISCORD_WEBHOOK }}"
