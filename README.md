@@ -1,8 +1,8 @@
-# XRP Trading System - Architecture & Continuity Repository
+# Inference Trading System - Architecture & Continuity Repository
 
 ## 🎯 **Purpose**
 
-This repository serves as the **central knowledge base** and **continuity system** for the XRP Trading System project. It enables seamless handoffs between AI sessions and provides complete project context for any new contributor.
+This repository serves as the **central knowledge base** and **continuity system** for the Inference Trading System project. It enables seamless handoffs between AI sessions and provides complete project context for any new contributor.
 
 ## 📁 **Repository Structure**
 
