@@ -1,0 +1,181 @@
+name: Automated State Management
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Run every 30 minutes during active development
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      backup_type:
+        description: 'Type of backup to create'
+        required: true
+        default: 'manual'
+        type: choice
+        options:
+        - manual
+        - checkpoint
+        - emergency
+
+jobs:
+  state-backup:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Create automated backup
+      run: |
+        # Update current state with latest information
+        python3 << 'EOF'
+        import json
+        import os
+        from datetime import datetime
+        
+        state_file = "state_management/current_state.json"
+        
+        # Load existing state
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+        else:
+            state = {}
+        
+        # Update metadata
+        if 'project_metadata' not in state:
+            state['project_metadata'] = {}
+        
+        state['project_metadata']['last_updated'] = datetime.utcnow().isoformat() + "Z"
+        state['project_metadata']['backup_trigger'] = "${{ github.event_name }}"
+        
+        # Add automated backup record
+        if 'automated_backups' not in state:
+            state['automated_backups'] = []
+        
+        state['automated_backups'].append({
+            'timestamp': datetime.utcnow().isoformat() + "Z",
+            'trigger': "${{ github.event_name }}",
+            'workflow_run_id': "${{ github.run_id }}",
+            'commit_sha': "${{ github.sha }}"
+        })
+        
+        # Keep only last 10 backup records
+        state['automated_backups'] = state['automated_backups'][-10:]
+        
+        # Save updated state
+        with open(state_file, 'w') as f:
+            json.dump(state, f, indent=2)
+        
+        print("✅ State updated with backup information")
+        EOF
+
+    - name: Commit state updates
+      run: |
+        git config --local user.email "manus-automation@github.com"
+        git config --local user.name "Manus State Manager"
+        
+        if git diff --quiet; then
+          echo "No changes to commit"
+        else
+          git add state_management/current_state.json
+          git commit -m "Automated state backup - $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
+        fi
+
+    - name: Create checkpoint on manual trigger
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        python3 state_management/checkpoint_manager.py create "Manual checkpoint via GitHub Actions - ${{ github.event.inputs.backup_type }}"
+
+    - name: Send Discord notification
+      if: always()
+      run: |
+        if [[ "${{ job.status }}" == "success" ]]; then
+          STATUS_EMOJI="✅"
+          STATUS_COLOR=3066993
+          STATUS_TITLE="State Backup Successful"
+        else
+          STATUS_EMOJI="❌"
+          STATUS_COLOR=15158332
+          STATUS_TITLE="State Backup Failed"
+        fi
+        
+        curl -H "Content-Type: application/json" -d "{
+          \"embeds\": [{
+            \"title\": \"${STATUS_EMOJI} ${STATUS_TITLE}\",
+            \"description\": \"Automated state management backup completed\",
+            \"color\": ${STATUS_COLOR},
+            \"fields\": [
+              {\"name\": \"🔄 Trigger\", \"value\": \"${{ github.event_name }}\", \"inline\": true},
+              {\"name\": \"⏰ Time\", \"value\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"inline\": true},
+              {\"name\": \"📝 Commit\", \"value\": \"[\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})\", \"inline\": true}
+            ],
+            \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",
+            \"footer\": {\"text\": \"XRP Trading System State Management\"}
+          }]
+        }" "${{ secrets.DISCORD_WEBHOOK }}" || true
+
+  status-report:
+    runs-on: ubuntu-latest
+    needs: state-backup
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Generate status report
+      run: |
+        python3 state_management/checkpoint_manager.py status > status_report.txt
+        
+        # Send detailed status to Discord
+        STATUS_CONTENT=$(cat status_report.txt | head -20)
+        
+        curl -H "Content-Type: application/json" -d "{
+          \"embeds\": [{
+            \"title\": \"📊 XRP Trading System Status Report\",
+            \"description\": \"\`\`\`\n${STATUS_CONTENT}\n\`\`\`\",
+            \"color\": 3447003,
+            \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",
+            \"footer\": {\"text\": \"Automated Status Report\"}
+          }]
+        }" "${{ secrets.DISCORD_WEBHOOK }}" || true
+
+  emergency-restore:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.backup_type == 'emergency'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Emergency notification
+      run: |
+        curl -H "Content-Type: application/json" -d "{
+          \"embeds\": [{
+            \"title\": \"🚨 EMERGENCY STATE RESTORE TRIGGERED\",
+            \"description\": \"Emergency backup and restore procedure initiated by user request\",
+            \"color\": 15158332,
+            \"fields\": [
+              {\"name\": \"🔄 Action\", \"value\": \"Emergency Restore\", \"inline\": true},
+              {\"name\": \"👤 Triggered By\", \"value\": \"${{ github.actor }}\", \"inline\": true},
+              {\"name\": \"⏰ Time\", \"value\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"inline\": true}
+            ],
+            \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",
+            \"footer\": {\"text\": \"XRP Trading System Emergency Procedures\"}
+          }]
+        }" "${{ secrets.DISCORD_WEBHOOK }}"
+
+    - name: Create emergency checkpoint
+      run: |
+        python3 state_management/checkpoint_manager.py create "EMERGENCY CHECKPOINT - Manual intervention required"
+        
+        # List available checkpoints for restore
+        echo "Available checkpoints for restore:"
+        python3 state_management/checkpoint_manager.py list
