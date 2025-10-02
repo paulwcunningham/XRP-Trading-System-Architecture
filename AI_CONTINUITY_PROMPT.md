@@ -1,4 +1,4 @@
-# XRP Trading System - AI Continuity Prompt
+'''# XRP Trading System - AI Continuity Prompt
 
 ## 🎯 **INSTANT CONTEXT INJECTION**
 
@@ -151,3 +151,25 @@ ssh -o ProxyJump=ec2-user@57.181.26.87 ec2-user@10.0.133.93 'systemctl status mo
 ---
 
 **Use this prompt to instantly understand the project state and continue development without missing context.**
+
+## 🚨 **Critical Reminder for All AI Sessions** 🚨
+
+**Before taking any action, you MUST perform a comprehensive review of the entire codebase and all relevant documentation.** This is not optional. It is a mandatory step to prevent redundant work, avoid repeating past mistakes, and ensure you have the absolute latest context.
+
+### **Your Pre-computation Checklist:**
+
+1.  **Full Codebase Scan:**
+    *   Recursively list all files in the project directories (`SignalEngine`, `TradeServer`, `FeedServer`, `Monitoring-Server`).
+    *   Read the contents of all key configuration files (`appsettings.json`, `*.csproj`, etc.).
+    *   Familiarize yourself with the project structure and namespaces.
+
+2.  **Documentation Deep Dive:**
+    *   Read all Markdown files in the `XRP-Trading-System-Architecture` repository.
+    *   Pay close attention to `SYSTEM_ARCHITECTURE.md`, `IMMEDIATE_ACTION_PLAN.md`, and the `README.md`.
+
+3.  **State and Log Analysis:**
+    *   Review the `current_state` directory to understand the live operational status.
+    *   Check the `deployment_logs` for recent activity and potential errors.
+
+**Do not assume you know the current state.** Verify it. Every time. This discipline will save significant time and compute resources. Failure to do so will result in wasted effort and project delays. Acknowledge this directive and proceed with a full system audit before any other action.
+'''
